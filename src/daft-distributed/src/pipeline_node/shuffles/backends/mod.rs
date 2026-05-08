@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use common_error::DaftResult;
 use common_partitioning::PartitionRef;
 use daft_local_plan::{
@@ -15,19 +17,45 @@ use crate::{
     utils::channel::Sender,
 };
 
+#[cfg(feature = "celeborn")]
+mod celeborn;
 mod flight;
 mod ray;
 
+#[cfg(feature = "celeborn")]
+use celeborn::CelebornShuffleReadSpec;
+#[cfg(feature = "celeborn")]
+pub(crate) use celeborn::CelebornShuffleSpec;
 pub(crate) use flight::FlightShuffleBackendConfig;
 
+// Process-level seed derived from startup time. Mixed into every shuffle_id
+// so that restarts against the same Celeborn LifecycleManager (fixed app_id)
+// do not collide with stale data from a previous run.
+static SHUFFLE_SESSION_SEED: LazyLock<u16> = LazyLock::new(|| {
+    use std::time::SystemTime;
+    (SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        & 0x1FFF) as u16
+});
+
 fn make_shuffle_id(context: &PipelineNodeContext) -> u64 {
-    ((context.query_idx as u64) << 32) | (context.node_id as u64)
+    // Layout: [seed:13][query_idx:10][node_id:8] = 31 bits.
+    // Fits in i32 (required by the Celeborn C++ FFI) while providing
+    // cross-restart uniqueness via the session seed.
+    let seed = *SHUFFLE_SESSION_SEED as u64;
+    let query = (context.query_idx as u64) & 0x3FF;
+    let node = (context.node_id as u64) & 0xFF;
+    (seed << 18) | (query << 8) | node
 }
 
 #[derive(Clone)]
 pub(crate) enum DistributedShuffleBackend {
     Ray,
     Flight(FlightShuffleBackendConfig),
+    #[cfg(feature = "celeborn")]
+    Celeborn(CelebornShuffleSpec),
 }
 
 #[derive(Clone)]
@@ -55,6 +83,13 @@ impl ShuffleBackend {
                         compression: backend.compression,
                     })
                 }
+                #[cfg(feature = "celeborn")]
+                DistributedShuffleBackend::Celeborn(backend) => {
+                    DistributedShuffleBackend::Celeborn(CelebornShuffleSpec {
+                        shuffle_id: make_shuffle_id(context),
+                        num_mappers: backend.num_mappers,
+                    })
+                }
             },
         }
     }
@@ -77,6 +112,10 @@ impl ShuffleBackend {
             DistributedShuffleBackend::Flight(backend) => {
                 flight::register_cleanup(backend, plan_context);
             }
+            #[cfg(feature = "celeborn")]
+            DistributedShuffleBackend::Celeborn(backend) => {
+                celeborn::register_cleanup(backend, plan_context);
+            }
         }
     }
 
@@ -90,6 +129,11 @@ impl ShuffleBackend {
                 shuffle_id: cfg.shuffle_id,
                 shuffle_dirs: cfg.shuffle_dirs,
                 compression: cfg.compression,
+            },
+            #[cfg(feature = "celeborn")]
+            DistributedShuffleBackend::Celeborn(cfg) => LocalShuffleBackend::Celeborn {
+                shuffle_id: cfg.shuffle_id,
+                num_mappers: cfg.num_mappers,
             },
         }
     }
@@ -135,7 +179,10 @@ impl ShuffleBackend {
                 let shuffle_read = LocalPhysicalPlan::shuffle_read(
                     node_id,
                     self.schema.clone(),
-                    ShuffleReadBackend::Flight,
+                    ShuffleReadBackend::Flight {
+                        shuffle_id: 0,
+                        server_cache_mapping: Default::default(),
+                    },
                     StatsState::NotMaterialized,
                     LocalNodeContext::new(Some(node_id as usize)),
                 );
@@ -145,6 +192,10 @@ impl ShuffleBackend {
                     vec![FlightShuffleReadInput { refs: flight_refs }],
                 )
             }
+            #[cfg(feature = "celeborn")]
+            DistributedShuffleBackend::Celeborn(_) => {
+                unreachable!("Celeborn does not use produce_read_task; use emit_read_tasks instead")
+            }
         }
     }
 
@@ -153,6 +204,7 @@ impl ShuffleBackend {
         partition_groups: Vec<Vec<MaterializedOutput>>,
         node: &dyn PipelineNodeImpl,
         result_tx: Sender<SwordfishTaskBuilder>,
+        num_partitions: usize,
     ) -> DaftResult<()> {
         match &self.backend {
             DistributedShuffleBackend::Ray => {
@@ -170,6 +222,20 @@ impl ShuffleBackend {
                     self.node_id,
                     self.schema.clone(),
                     partition_groups,
+                    node,
+                    result_tx,
+                )
+                .await
+            }
+            #[cfg(feature = "celeborn")]
+            DistributedShuffleBackend::Celeborn(backend) => {
+                let read_spec: CelebornShuffleReadSpec = celeborn::read_spec_from_backend(backend);
+                celeborn::emit_read_tasks(
+                    self.node_id,
+                    self.schema.clone(),
+                    num_partitions,
+                    backend,
+                    read_spec,
                     node,
                     result_tx,
                 )

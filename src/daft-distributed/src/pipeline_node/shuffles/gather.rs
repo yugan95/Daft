@@ -79,7 +79,7 @@ impl GatherNode {
 
         // Gather = single read task that consumes every ref from every worker.
         self.shuffle_backend
-            .emit_read_tasks(vec![materialized], self.as_ref(), result_tx)
+            .emit_read_tasks(vec![materialized], self.as_ref(), result_tx, 1)
             .await
     }
 }
@@ -101,6 +101,8 @@ impl PipelineNodeImpl for GatherNode {
         let backend_name = match self.shuffle_backend.backend() {
             DistributedShuffleBackend::Ray => "RayGather",
             DistributedShuffleBackend::Flight(_) => "FlightGather",
+            #[cfg(feature = "celeborn")]
+            DistributedShuffleBackend::Celeborn(_) => "CelebornGather",
         };
         vec![backend_name.to_string()]
     }

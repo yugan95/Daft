@@ -28,6 +28,7 @@ use crate::{
     },
     resource_manager::MemoryManager,
     runtime_stats::{DefaultRuntimeStats, RuntimeStats, RuntimeStatsManagerHandle},
+    sinks::shuffle_metadata::ShufflePartitionMeta,
 };
 
 pub(crate) type BlockingSinkSinkResult<Op> =
@@ -35,7 +36,9 @@ pub(crate) type BlockingSinkSinkResult<Op> =
 pub(crate) enum BlockingSinkOutput {
     Partitions(Vec<MicroPartition>),
     FlightPartitionRefs(Vec<FlightPartitionRef>),
+    ShufflePartitionMetas(Vec<ShufflePartitionMeta>),
 }
+
 pub(crate) type BlockingSinkFinalizeResult = OperatorOutput<DaftResult<BlockingSinkOutput>>;
 
 pub(crate) trait BlockingSink: Send + Sync {
@@ -288,6 +291,18 @@ impl<Op: BlockingSink + 'static> BlockingSinkNode<Op> {
                             })
                             .await;
                     }
+                }
+                BlockingSinkOutput::ShufflePartitionMetas(metas) => {
+                    // Celeborn shuffle metadata is informational only; data
+                    // has already been pushed to the remote service during sink().
+                    let total_rows: usize = metas.iter().map(|m| m.num_rows).sum();
+                    let total_bytes: usize = metas.iter().map(|m| m.size_bytes).sum();
+                    tracing::debug!(
+                        partitions = metas.len(),
+                        total_rows,
+                        total_bytes,
+                        "Celeborn shuffle write complete"
+                    );
                 }
             }
             if let Some((store, _, _, _)) = &checkpoint {

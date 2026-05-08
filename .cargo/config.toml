@@ -1,2 +1,5 @@
 [env]
 PYO3_PYTHON = "./.venv/bin/python"
+
+[net]
+git-fetch-with-cli = true

@@ -106,6 +106,29 @@ impl DaftPlanningConfig {
     }
 }
 
+/// Configuration for the Celeborn shuffle backend.
+///
+/// When present in [`DaftExecutionConfig`], indicates that the Celeborn
+/// shuffle backend is available and provides the connection parameters
+/// needed to reach the LifecycleManager.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CelebornConfig {
+    /// LifecycleManager hostname or IP address.
+    pub lm_host: String,
+    /// LifecycleManager port.
+    pub lm_port: i32,
+    /// Application-level identifier for this Celeborn session.
+    pub app_id: String,
+    /// Compression codec for shuffle blocks (`"lz4"`, `"zstd"`, or `"none"`).
+    pub compression: String,
+    /// Timeout in milliseconds for push-data RPCs. `None` means use the
+    /// Celeborn C++ client's built-in default.
+    pub push_data_timeout_ms: Option<u64>,
+    /// Timeout in milliseconds for fetch-data RPCs. `None` means use the
+    /// Celeborn C++ client's built-in default.
+    pub fetch_data_timeout_ms: Option<u64>,
+}
+
 /// Configurations for Daft to use during the execution of a Dataframe
 ///  Note that this should be immutable for a given end-to-end execution of a logical plan.
 ///
@@ -152,6 +175,7 @@ pub struct DaftExecutionConfig {
     pub enable_dynamic_batching: bool,
     pub dynamic_batching_strategy: String,
     pub flight_shuffle_dirs: Vec<String>,
+    pub celeborn: Option<CelebornConfig>,
     pub enable_multi_glob_path_tasks: bool,
 }
 
@@ -199,6 +223,7 @@ impl Default for DaftExecutionConfig {
             enable_dynamic_batching: false,
             dynamic_batching_strategy: "auto".to_string(),
             flight_shuffle_dirs: vec!["/tmp".to_string()],
+            celeborn: None,
             enable_multi_glob_path_tasks: false,
         }
     }

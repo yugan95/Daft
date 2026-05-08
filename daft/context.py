@@ -243,6 +243,12 @@ def set_execution_config(
     enable_dynamic_batching: bool | None = None,
     dynamic_batching_strategy: str | None = None,
     flight_shuffle_dirs: list[str] | None = None,
+    celeborn_lm_host: str | None = None,
+    celeborn_lm_port: int | None = None,
+    celeborn_app_id: str | None = None,
+    celeborn_compression: str | None = None,
+    celeborn_push_data_timeout_ms: int | None = None,
+    celeborn_fetch_data_timeout_ms: int | None = None,
     enable_multi_glob_path_tasks: bool | None = None,
 ) -> DaftContext:
     """Globally sets various configuration parameters which control various aspects of Daft execution.
@@ -334,6 +340,12 @@ def set_execution_config(
             enable_dynamic_batching=enable_dynamic_batching,
             dynamic_batching_strategy=dynamic_batching_strategy,
             flight_shuffle_dirs=flight_shuffle_dirs,
+            celeborn_lm_host=celeborn_lm_host,
+            celeborn_lm_port=celeborn_lm_port,
+            celeborn_app_id=celeborn_app_id,
+            celeborn_compression=celeborn_compression,
+            celeborn_push_data_timeout_ms=celeborn_push_data_timeout_ms,
+            celeborn_fetch_data_timeout_ms=celeborn_fetch_data_timeout_ms,
             enable_multi_glob_path_tasks=enable_multi_glob_path_tasks,
         )
 

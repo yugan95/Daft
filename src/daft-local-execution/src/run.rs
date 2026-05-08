@@ -203,6 +203,60 @@ impl PyNativeExecutor {
         self.address.clone()
     }
 
+    /// Connect to a Celeborn LifecycleManager and set the resulting client
+    /// on this executor.
+    ///
+    /// Configuration is read from the `DaftExecutionConfig.celeborn` field.
+    /// Must be called before any shuffle task that uses the Celeborn backend.
+    /// Idempotent: if a client is already connected, this is a no-op.
+    ///
+    /// # Arguments
+    /// * `daft_execution_config` - A `PyDaftExecutionConfig` whose inner
+    ///   `celeborn` field supplies the connection parameters (lm_host,
+    ///   lm_port, app_id, compression).
+    #[cfg(feature = "celeborn")]
+    pub fn set_celeborn_client(
+        &self,
+        py: Python<'_>,
+        daft_execution_config: &PyDaftExecutionConfig,
+    ) -> PyResult<()> {
+        if self
+            .executor
+            .lock_py_attached(py)
+            .unwrap()
+            .has_celeborn_client()
+        {
+            return Ok(());
+        }
+
+        let exec_config = daft_execution_config.config.as_ref();
+        let celeborn_cfg = exec_config.celeborn.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "DaftExecutionConfig.celeborn is None; \
+                 set celeborn config via with_config_values() before calling set_celeborn_client()",
+            )
+        })?;
+
+        let client_config = daft_shuffles::client::celeborn::CelebornClientConfig {
+            lm_host: celeborn_cfg.lm_host.clone(),
+            lm_port: celeborn_cfg.lm_port,
+            app_id: celeborn_cfg.app_id.clone(),
+            compression: celeborn_cfg.compression.clone(),
+        };
+        let client = daft_shuffles::client::celeborn::connect_celeborn_client(&client_config)
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to connect to Celeborn LifecycleManager at {}:{}: {e}",
+                    celeborn_cfg.lm_host, celeborn_cfg.lm_port
+                ))
+            })?;
+        self.executor
+            .lock_py_attached(py)
+            .unwrap()
+            .set_celeborn_client(client);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (local_physical_plan, daft_ctx, input_id, inputs, context=None, maintain_order=true))]
     pub fn run<'py>(
@@ -396,6 +450,11 @@ pub struct NativeExecutor {
     is_flotilla_worker: bool,
     shuffle_server: Option<Arc<ShuffleFlightServer>>,
     shuffle_server_connection: Option<FlightServerConnectionHandle>,
+    /// Global Celeborn shuffle client, shared across all queries/shuffles on
+    /// this worker. Created once via [`Self::set_celeborn_client`] and injected
+    /// into every [`BuilderContext`] so that pipeline nodes can use it.
+    #[cfg(feature = "celeborn")]
+    celeborn_client: Option<Arc<dyn daft_shuffles::client::celeborn::CelebornClient>>,
     plans: HashMap<u64, PlanState>,
 }
 
@@ -411,6 +470,8 @@ impl NativeExecutor {
                 is_flotilla_worker: true,
                 shuffle_server: Some(shuffle_server),
                 shuffle_server_connection,
+                #[cfg(feature = "celeborn")]
+                celeborn_client: None,
                 plans: HashMap::new(),
             }
         } else {
@@ -419,9 +480,31 @@ impl NativeExecutor {
                 is_flotilla_worker: false,
                 shuffle_server: None,
                 shuffle_server_connection: None,
+                #[cfg(feature = "celeborn")]
+                celeborn_client: None,
                 plans: HashMap::new(),
             }
         }
+    }
+
+    /// Set the global Celeborn shuffle client for this executor.
+    ///
+    /// Must be called before any shuffle task that uses the Celeborn backend.
+    /// The client is injected into every `BuilderContext` created by `run()`.
+    /// Idempotent: once a client is set it is never replaced.
+    #[cfg(feature = "celeborn")]
+    pub fn set_celeborn_client(
+        &mut self,
+        client: Arc<dyn daft_shuffles::client::celeborn::CelebornClient>,
+    ) {
+        if self.celeborn_client.is_none() {
+            self.celeborn_client = Some(client);
+        }
+    }
+
+    #[cfg(feature = "celeborn")]
+    pub fn has_celeborn_client(&self) -> bool {
+        self.celeborn_client.is_some()
     }
 
     pub fn shuffle_address(&self) -> Option<String> {
@@ -484,6 +567,10 @@ impl NativeExecutor {
                     .as_ref()
                     .map(|server| (server.clone(), shuffle_address.unwrap())),
             );
+            #[cfg(feature = "celeborn")]
+            if let Some(celeborn_client) = &self.celeborn_client {
+                ctx.set_celeborn_client(celeborn_client.clone());
+            }
             let (pipeline, input_senders) =
                 translate_physical_plan_to_pipeline(local_physical_plan, &exec_cfg, &ctx)?;
 

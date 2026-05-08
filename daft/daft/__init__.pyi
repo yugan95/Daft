@@ -2388,6 +2388,7 @@ class Input:
 class NativeExecutor:
     def __init__(self, is_flotilla_worker: bool, ip: str) -> None: ...
     def shuffle_address(self) -> str | None: ...
+    def set_celeborn_client(self, daft_execution_config: PyDaftExecutionConfig) -> None: ...
     async def run(
         self,
         plan: LocalPhysicalPlan,
@@ -2446,6 +2447,12 @@ class PyDaftExecutionConfig:
         dynamic_batching_strategy: str | None = None,
         flight_shuffle_dirs: list[str] | None = None,
         enable_multi_glob_path_tasks: bool | None = None,
+        celeborn_lm_host: str | None = None,
+        celeborn_lm_port: int | None = None,
+        celeborn_app_id: str | None = None,
+        celeborn_compression: str | None = None,
+        celeborn_push_data_timeout_ms: int | None = None,
+        celeborn_fetch_data_timeout_ms: int | None = None,
     ) -> PyDaftExecutionConfig: ...
     @property
     def enable_scan_task_split_and_merge(self) -> bool: ...

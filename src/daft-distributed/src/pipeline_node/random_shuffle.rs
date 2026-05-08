@@ -150,6 +150,8 @@ impl PipelineNodeImpl for RandomShuffleNode {
         let backend_name = match self.shuffle_backend.backend() {
             DistributedShuffleBackend::Ray => "Ray",
             DistributedShuffleBackend::Flight(_) => "Flight",
+            #[cfg(feature = "celeborn")]
+            DistributedShuffleBackend::Celeborn(_) => "Celeborn",
         };
         vec![
             format!(

@@ -9,10 +9,14 @@ use common_error::DaftResult;
 use common_metrics::ops::NodeType;
 use common_runtime::{JoinSet, combine_stream, get_compute_pool_num_threads, get_io_runtime};
 use daft_core::prelude::SchemaRef;
+#[cfg(feature = "celeborn")]
+use daft_local_plan::CelebornShuffleReadInput;
 use daft_local_plan::{FlightShuffleReadInput, InputId};
 use daft_micropartition::MicroPartition;
 use daft_partition_refs::FlightPartitionRef;
 use daft_recordbatch::RecordBatch;
+#[cfg(feature = "celeborn")]
+use daft_shuffles::client::celeborn::CelebornClient;
 use daft_shuffles::{client::FlightClientManager, server::flight_server::ShuffleFlightServer};
 use futures::{FutureExt, StreamExt, stream::BoxStream};
 use tracing::instrument;
@@ -239,6 +243,239 @@ async fn forward_partition_stream(
             .await;
     }
     Ok(input_id)
+}
+
+// =====================================================================
+// Celeborn shuffle read source
+// =====================================================================
+
+/// Reduce-side source that pulls partition data from a Celeborn cluster.
+///
+/// In contrast with [`ShuffleReadSource`] (Flight), Celeborn aggregates each
+/// reduce partition cluster-side and exposes it as a single logical stream of
+/// Arrow IPC bytes. There is no "local vs remote" distinction and no
+/// per-mapper fan-out on the reader: one `read_partition` call returns all
+/// blocks for the partition.
+#[cfg(feature = "celeborn")]
+pub struct CelebornShuffleReadSource {
+    receiver: UnboundedReceiver<(InputId, Vec<CelebornShuffleReadInput>)>,
+    shuffle_id: u64,
+    num_mappers: u32,
+    client: Arc<dyn CelebornClient>,
+    schema: SchemaRef,
+    num_parallel_tasks: usize,
+}
+
+#[cfg(feature = "celeborn")]
+impl CelebornShuffleReadSource {
+    pub fn try_new(
+        receiver: UnboundedReceiver<(InputId, Vec<CelebornShuffleReadInput>)>,
+        shuffle_id: u64,
+        num_mappers: u32,
+        client: Arc<dyn CelebornClient>,
+        schema: SchemaRef,
+        cfg: &DaftExecutionConfig,
+    ) -> DaftResult<Self> {
+        let num_cpus = get_compute_pool_num_threads();
+        let num_parallel_tasks = if cfg.scantask_max_parallel > 0 {
+            cfg.scantask_max_parallel
+        } else {
+            num_cpus
+        };
+
+        Ok(Self {
+            receiver,
+            shuffle_id,
+            num_mappers,
+            client,
+            schema,
+            num_parallel_tasks,
+        })
+    }
+
+    fn spawn_celeborn_shuffle_processor(
+        self,
+        output_sender: Sender<PipelineMessage>,
+    ) -> common_runtime::RuntimeTask<DaftResult<()>> {
+        let mut receiver = self.receiver;
+        let num_parallel_tasks = self.num_parallel_tasks;
+        let shuffle_id = self.shuffle_id;
+        let num_mappers = self.num_mappers;
+        let schema = self.schema.clone();
+        let client = self.client.clone();
+
+        let io_runtime = get_io_runtime(true);
+        io_runtime.spawn(async move {
+            client.register_shuffle(shuffle_id, num_mappers, 0).await?;
+
+            let mut task_set: JoinSet<DaftResult<InputId>> = JoinSet::new();
+            let mut pending_tasks: VecDeque<(InputId, CelebornShuffleReadInput)> = VecDeque::new();
+            let mut input_id_pending_counts: HashMap<InputId, usize> = HashMap::new();
+            let mut receiver_exhausted = false;
+
+            while !receiver_exhausted || !pending_tasks.is_empty() || !task_set.is_empty() {
+                // Drain pending partition fetches up to the parallelism cap.
+                while task_set.len() < num_parallel_tasks
+                    && let Some((input_id, input)) = pending_tasks.pop_front()
+                {
+                    let stream = client
+                        .read_partition(shuffle_id, input.partition_idx as u32)
+                        .await?;
+                    task_set.spawn(forward_celeborn_partition_stream(
+                        stream,
+                        schema.clone(),
+                        output_sender.clone(),
+                        input_id,
+                    ));
+                }
+
+                tokio::select! {
+                    recv_result = receiver.recv(), if !receiver_exhausted => {
+                        match recv_result {
+                            Some((input_id, inputs)) if inputs.is_empty() => {
+                                let empty = MicroPartition::empty(Some(schema.clone()));
+                                if output_sender.send(PipelineMessage::Morsel {
+                                    input_id,
+                                    partition: empty,
+                                }).await.is_err() {
+                                    return Ok(());
+                                }
+                                if output_sender.send(PipelineMessage::Flush(input_id)).await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            Some((input_id, inputs)) => {
+                                let num_inputs = inputs.len();
+                                *input_id_pending_counts.entry(input_id).or_insert(0) += num_inputs;
+                                for input in inputs {
+                                    pending_tasks.push_back((input_id, input));
+                                }
+                            }
+                            None => {
+                                receiver_exhausted = true;
+                            }
+                        }
+                    }
+                    Some(join_result) = task_set.join_next(), if !task_set.is_empty() => {
+                        match join_result {
+                            Ok(Ok(completed_input_id)) => {
+                                let count = input_id_pending_counts.get_mut(&completed_input_id).expect("Input id should be present in input_id_pending_counts");
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    input_id_pending_counts.remove(&completed_input_id);
+                                    if output_sender.send(PipelineMessage::Flush(completed_input_id)).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Ok(Err(e)) => return Err(e),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                }
+            }
+
+            // Clean up local shuffle metadata now that all reduce tasks
+            // have completed. Server-side cleanup relies on Celeborn's
+            // own GC mechanism; this only removes the local entry from
+            // the client's `shuffle_meta` map to prevent unbounded growth.
+            if let Err(e) = client.unregister_shuffle(shuffle_id).await {
+                tracing::warn!(
+                    shuffle_id,
+                    error = %e,
+                    "Failed to unregister Celeborn shuffle; \
+                     local metadata may leak until client is dropped"
+                );
+            }
+
+            Ok(())
+        })
+    }
+}
+
+/// Decode each Arrow-IPC byte chunk returned by `CelebornClient::read_partition`
+/// into a `MicroPartition` and forward it as a `Morsel` to the downstream
+/// pipeline. Empty chunks are dropped to avoid sending zero-row morsels.
+#[cfg(feature = "celeborn")]
+async fn forward_celeborn_partition_stream(
+    mut stream: BoxStream<'static, DaftResult<bytes::Bytes>>,
+    _schema: SchemaRef,
+    sender: Sender<PipelineMessage>,
+    input_id: InputId,
+) -> DaftResult<InputId> {
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk?;
+        if bytes.is_empty() {
+            continue;
+        }
+        // Each chunk pushed by a mapper is a self-contained Arrow IPC stream
+        // (see `RepartitionSink::sink` Celeborn branch). We decode the entire
+        // chunk into one `MicroPartition` rather than per-batch so that
+        // downstream operators see the same morsel granularity as the writer.
+        let mp = MicroPartition::read_from_ipc_stream(&bytes).map_err(|e| {
+            common_error::DaftError::External(
+                format!(
+                    "Celeborn shuffle read: failed to decode Arrow IPC stream \
+                     ({} bytes) for input {input_id}: {e}",
+                    bytes.len()
+                )
+                .into(),
+            )
+        })?;
+        if mp.is_empty() {
+            continue;
+        }
+        if sender
+            .send(PipelineMessage::Morsel {
+                input_id,
+                partition: mp,
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    Ok(input_id)
+}
+
+#[cfg(feature = "celeborn")]
+#[async_trait]
+impl Source for CelebornShuffleReadSource {
+    fn name(&self) -> NodeName {
+        "ShuffleRead".into()
+    }
+
+    fn op_type(&self) -> NodeType {
+        NodeType::ScanTask
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn multiline_display(&self) -> Vec<String> {
+        vec![format!(
+            "ShuffleRead(Celeborn): shuffle_id={}",
+            self.shuffle_id
+        )]
+    }
+
+    #[instrument(skip_all, name = "CelebornShuffleReadSource::get_data")]
+    fn get_data(
+        self: Box<Self>,
+        _maintain_order: bool,
+        _stats_provider: StatsProvider,
+        _chunk_size: usize,
+    ) -> DaftResult<SourceStream<'static>> {
+        let (output_sender, output_receiver) = create_channel::<PipelineMessage>(1);
+        let processor_task = self.spawn_celeborn_shuffle_processor(output_sender);
+
+        let result_stream = output_receiver.into_stream().map(Ok);
+        let combined_stream = combine_stream(result_stream, processor_task.map(|x| x?));
+
+        Ok(Box::pin(combined_stream))
+    }
 }
 
 #[async_trait]

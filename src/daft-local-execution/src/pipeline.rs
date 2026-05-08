@@ -15,6 +15,8 @@ use common_metrics::{
 };
 use daft_core::{join::JoinSide, prelude::Schema};
 use daft_dsl::{common_treenode::ConcreteTreeNode, join::get_common_join_cols};
+#[cfg(feature = "celeborn")]
+use daft_local_plan::CelebornShuffleReadInput;
 pub use daft_local_plan::InputId;
 use daft_local_plan::{
     AsofJoin, CommitWrite, Concat, CrossJoin, Dedup, Explode, Filter, FlightShuffleReadInput,
@@ -277,6 +279,13 @@ pub struct BuilderContext {
             daft_dsl::expr::bound_expr::BoundExpr,
         )>,
     >,
+    /// Global Celeborn shuffle client, injected by the `NativeExecutor` when
+    /// the active shuffle algorithm is "celeborn". Uses `RefCell` so it can
+    /// be set through a shared `&BuilderContext` reference (same pattern as
+    /// `checkpoint`).
+    #[cfg(feature = "celeborn")]
+    celeborn_client:
+        std::cell::RefCell<Option<Arc<dyn daft_shuffles::client::celeborn::CelebornClient>>>,
 }
 
 impl BuilderContext {
@@ -298,6 +307,8 @@ impl BuilderContext {
             context,
             shuffle_server,
             checkpoint: std::cell::RefCell::new(None),
+            #[cfg(feature = "celeborn")]
+            celeborn_client: std::cell::RefCell::new(None),
         }
     }
 
@@ -322,6 +333,26 @@ impl BuilderContext {
         daft_dsl::expr::bound_expr::BoundExpr,
     )> {
         self.checkpoint.borrow().clone()
+    }
+
+    /// Inject the global Celeborn client into this builder context.
+    ///
+    /// Called by `NativeExecutor::run` when a Celeborn client has been
+    /// configured. Must be set before `translate_physical_plan_to_pipeline`
+    /// if any plan node uses the Celeborn shuffle backend.
+    #[cfg(feature = "celeborn")]
+    pub fn set_celeborn_client(
+        &self,
+        client: Arc<dyn daft_shuffles::client::celeborn::CelebornClient>,
+    ) {
+        *self.celeborn_client.borrow_mut() = Some(client);
+    }
+
+    #[cfg(feature = "celeborn")]
+    pub fn celeborn_client(
+        &self,
+    ) -> Option<Arc<dyn daft_shuffles::client::celeborn::CelebornClient>> {
+        self.celeborn_client.borrow().clone()
     }
 
     pub fn next_id(&self) -> usize {
@@ -1607,6 +1638,10 @@ fn physical_plan_to_pipeline(
                     )
                     .boxed()
                 }
+                #[cfg(feature = "celeborn")]
+                daft_local_plan::ShuffleBackend::Celeborn { .. } => {
+                    unimplemented!("Celeborn into_partitions is not yet supported")
+                }
             }
         }
         LocalPhysicalPlan::RepartitionWrite(RepartitionWrite {
@@ -1653,6 +1688,30 @@ fn physical_plan_to_pipeline(
                         plan_name: physical_plan.name(),
                     })?;
 
+                    BlockingSinkNode::new(
+                        Arc::new(repartition_sink),
+                        child_node,
+                        stats_state.clone(),
+                        ctx,
+                        context,
+                    )
+                    .boxed()
+                }
+                #[cfg(feature = "celeborn")]
+                ShuffleBackend::Celeborn {
+                    shuffle_id,
+                    num_mappers,
+                } => {
+                    let client = ctx.celeborn_client().expect(
+                        "Celeborn client must be set on BuilderContext before pipeline translation",
+                    );
+                    let repartition_sink = RepartitionSink::new_celeborn(
+                        *num_partitions,
+                        *shuffle_id,
+                        *num_mappers,
+                        repartition_spec.clone(),
+                        client,
+                    );
                     BlockingSinkNode::new(
                         Arc::new(repartition_sink),
                         child_node,
@@ -1710,6 +1769,10 @@ fn physical_plan_to_pipeline(
                     )
                     .boxed()
                 }
+                #[cfg(feature = "celeborn")]
+                ShuffleBackend::Celeborn { .. } => {
+                    unimplemented!("Celeborn gather is not yet supported")
+                }
             }
         }
         LocalPhysicalPlan::ShuffleRead(daft_local_plan::ShuffleRead {
@@ -1732,7 +1795,7 @@ fn physical_plan_to_pipeline(
                 )
                 .boxed()
             }
-            ShuffleReadBackend::Flight => {
+            ShuffleReadBackend::Flight { .. } => {
                 let (tx, rx) = create_unbounded_channel::<(InputId, Vec<FlightShuffleReadInput>)>();
                 input_senders.insert(*source_id, InputSender::FlightShuffle(tx));
                 let (local_server, local_address) = ctx.shuffle_server().expect(
@@ -1740,6 +1803,30 @@ fn physical_plan_to_pipeline(
                 );
                 let source =
                     ShuffleReadSource::new(rx, local_server, local_address, schema.clone(), cfg);
+                SourceNode::new(Box::new(source), stats_state.clone(), ctx, context).boxed()
+            }
+            #[cfg(feature = "celeborn")]
+            ShuffleReadBackend::Celeborn {
+                shuffle_id,
+                num_mappers,
+            } => {
+                let client = ctx.celeborn_client().expect(
+                    "Celeborn client must be set on BuilderContext before pipeline translation",
+                );
+                let (tx, rx) =
+                    create_unbounded_channel::<(InputId, Vec<CelebornShuffleReadInput>)>();
+                input_senders.insert(*source_id, InputSender::CelebornShuffle(tx));
+                let source = crate::sources::shuffle_read::CelebornShuffleReadSource::try_new(
+                    rx,
+                    *shuffle_id,
+                    *num_mappers,
+                    client,
+                    schema.clone(),
+                    cfg,
+                )
+                .with_context(|_| PipelineCreationSnafu {
+                    plan_name: physical_plan.name(),
+                })?;
                 SourceNode::new(Box::new(source), stats_state.clone(), ctx, context).boxed()
             }
         },

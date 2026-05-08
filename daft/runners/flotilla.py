@@ -110,6 +110,7 @@ class RaySwordfishActor:
         is_head: bool = False,
         event_log_dir: str | None = None,
         dashboard_url: str | None = None,
+        exec_config: PyDaftExecutionConfig | None = None,
     ) -> None:
         os.environ["DAFT_FLOTILLA_WORKER"] = "1"  # TODO: Remove once fixed DashboardSubscriber
 
@@ -142,6 +143,10 @@ class RaySwordfishActor:
 
         self.ip = ray.util.get_node_ip_address()
         self.native_executor = NativeExecutor(is_flotilla_worker=True, ip=self.ip)
+
+        # If Celeborn shuffle is configured, connect the global Celeborn client.
+        if exec_config is not None and getattr(exec_config, "celeborn_lm_host", None) is not None:
+            self.native_executor.set_celeborn_client(exec_config)
 
     def get_address(self) -> str:
         address = self.native_executor.shuffle_address()
@@ -180,6 +185,13 @@ class RaySwordfishActor:
         """Run a plan on swordfish and yield partitions."""
         # We import PyDaftContext inside the function because PyDaftContext is not serializable.
         from daft.daft import PyDaftContext
+
+        # Lazily inject the Celeborn client if the execution config carries
+        # Celeborn settings but the NativeExecutor hasn't been configured yet.
+        celeborn_lm_host = getattr(exec_cfg, "celeborn_lm_host", None)
+        celeborn_lm_port = getattr(exec_cfg, "celeborn_lm_port", None)
+        if celeborn_lm_host is not None and celeborn_lm_port is not None:
+            self.native_executor.set_celeborn_client(exec_cfg)
 
         with profile():
             resolved_inputs, task_id = await self._resolve_inputs(context, inputs)
@@ -363,6 +375,12 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RaySwordfishWorker
     if task_events_enabled:
         worker_env_vars["DAFT_TASK_EVENTS_ENABLED"] = task_events_enabled
 
+    # Celeborn shuffle configuration — read from global execution config and
+    # forward to every worker so each can create a global CelebornClient.
+    exec_cfg = get_context().daft_execution_config
+    celeborn_lm_host: str | None = getattr(exec_cfg, "celeborn_lm_host", None)
+    celeborn_exec_config: PyDaftExecutionConfig | None = exec_cfg if celeborn_lm_host is not None else None
+
     actors = []
     for node in ray.nodes():
         if (
@@ -388,6 +406,7 @@ def start_ray_workers(existing_worker_ids: list[str]) -> list[RaySwordfishWorker
                 is_head=is_head,
                 event_log_dir=event_log_dir,
                 dashboard_url=dashboard_url,
+                exec_config=celeborn_exec_config,
             )
             actors.append((node, actor))
 

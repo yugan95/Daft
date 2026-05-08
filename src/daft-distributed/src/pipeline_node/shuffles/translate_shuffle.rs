@@ -4,6 +4,8 @@ use common_error::DaftResult;
 use daft_logical_plan::partitioning::RepartitionSpec;
 use daft_schema::schema::SchemaRef;
 
+#[cfg(feature = "celeborn")]
+use crate::pipeline_node::shuffles::backends::CelebornShuffleSpec;
 use crate::pipeline_node::{
     DistributedPipelineNode,
     shuffles::{
@@ -18,13 +20,34 @@ use crate::pipeline_node::{
 impl LogicalPlanToPipelineNodeTranslator {
     /// Pick the shuffle backend implied by the current execution config.
     pub(crate) fn select_backend(&self) -> DistributedShuffleBackend {
-        if self.plan_config.config.shuffle_algorithm.as_str() == "flight_shuffle" {
-            DistributedShuffleBackend::Flight(FlightShuffleBackendConfig {
+        match self.plan_config.config.shuffle_algorithm.as_str() {
+            "flight_shuffle" => DistributedShuffleBackend::Flight(FlightShuffleBackendConfig {
+                shuffle_id: 0,
                 shuffle_dirs: self.plan_config.config.flight_shuffle_dirs.clone(),
-                ..Default::default()
-            })
-        } else {
-            DistributedShuffleBackend::Ray
+                compression: None,
+            }),
+            #[cfg(feature = "celeborn")]
+            "celeborn" => {
+                // Validate that celeborn config exists; connection parameters
+                // (lm_host, lm_port, etc.) live in `DaftExecutionConfig.celeborn`
+                // and are used directly by the worker-side `CelebornClient`.
+                self.plan_config
+                    .config
+                    .celeborn
+                    .as_ref()
+                    .expect("celeborn config must be set when shuffle_algorithm == \"celeborn\"");
+                DistributedShuffleBackend::Celeborn(CelebornShuffleSpec {
+                    // Real shuffle id is assigned later inside `ShuffleBackend::new`
+                    // via `make_shuffle_id(context)`; the value here is a
+                    // placeholder that will be overwritten.
+                    shuffle_id: 0,
+                    // Placeholder; the real value is set in
+                    // `gen_repartition_node_with_backend` once the upstream
+                    // partition count is known.
+                    num_mappers: 0,
+                })
+            }
+            _ => DistributedShuffleBackend::Ray,
         }
     }
 
@@ -45,16 +68,25 @@ impl LogicalPlanToPipelineNodeTranslator {
         child: DistributedPipelineNode,
         backend: DistributedShuffleBackend,
     ) -> DaftResult<DistributedPipelineNode> {
+        let input_num_partitions = child.config().clustering_spec.num_partitions();
         let num_partitions = match &repartition_spec {
-            RepartitionSpec::Hash(config) => config
-                .num_partitions
-                .unwrap_or_else(|| child.config().clustering_spec.num_partitions()),
-            RepartitionSpec::Random(config) => config
-                .num_partitions
-                .unwrap_or_else(|| child.config().clustering_spec.num_partitions()),
-            RepartitionSpec::Range(config) => config
-                .num_partitions
-                .unwrap_or_else(|| child.config().clustering_spec.num_partitions()),
+            RepartitionSpec::Hash(config) => config.num_partitions.unwrap_or(input_num_partitions),
+            RepartitionSpec::Random(config) => {
+                config.num_partitions.unwrap_or(input_num_partitions)
+            }
+            RepartitionSpec::Range(config) => config.num_partitions.unwrap_or(input_num_partitions),
+        };
+
+        // For Celeborn, set num_mappers from the upstream partition count
+        // (analogous to Spark's `dependency.rdd.getNumPartitions`). This
+        // avoids the need for a runtime collect-and-inject step.
+        #[cfg(feature = "celeborn")]
+        let backend = match backend {
+            DistributedShuffleBackend::Celeborn(mut cfg) => {
+                cfg.num_mappers = input_num_partitions as u32;
+                DistributedShuffleBackend::Celeborn(cfg)
+            }
+            other => other,
         };
 
         let use_pre_shuffle_merge = self.should_use_pre_shuffle_merge(&child, num_partitions)?;
@@ -101,6 +133,8 @@ impl LogicalPlanToPipelineNodeTranslator {
             "pre_shuffle_merge" => Ok(true),
             "map_reduce" => Ok(false),
             "flight_shuffle" => Ok(false), // Flight shuffle will be handled separately
+            #[cfg(feature = "celeborn")]
+            "celeborn" => Ok(false), // Celeborn handles aggregation cluster-side, no local pre-merge needed
             "auto" => {
                 let total_num_partitions = input_num_partitions * target_num_partitions;
                 let geometric_mean = (total_num_partitions as f64).sqrt() as usize;

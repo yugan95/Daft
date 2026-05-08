@@ -5,7 +5,7 @@ use common_py_serde::impl_bincode_py_state_serialization;
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{DaftEventLogConfig, DaftExecutionConfig, DaftPlanningConfig};
+use crate::{CelebornConfig, DaftEventLogConfig, DaftExecutionConfig, DaftPlanningConfig};
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[pyclass(module = "daft.daft", from_py_object)]
@@ -123,6 +123,12 @@ impl PyDaftExecutionConfig {
         enable_dynamic_batching=None,
         dynamic_batching_strategy=None,
         flight_shuffle_dirs=None,
+        celeborn_lm_host=None,
+        celeborn_lm_port=None,
+        celeborn_app_id=None,
+        celeborn_compression=None,
+        celeborn_push_data_timeout_ms=None,
+        celeborn_fetch_data_timeout_ms=None,
         enable_multi_glob_path_tasks=None,
     ))]
     fn with_config_values(
@@ -161,6 +167,12 @@ impl PyDaftExecutionConfig {
         enable_dynamic_batching: Option<bool>,
         dynamic_batching_strategy: Option<&str>,
         flight_shuffle_dirs: Option<Vec<String>>,
+        celeborn_lm_host: Option<String>,
+        celeborn_lm_port: Option<i32>,
+        celeborn_app_id: Option<String>,
+        celeborn_compression: Option<String>,
+        celeborn_push_data_timeout_ms: Option<u64>,
+        celeborn_fetch_data_timeout_ms: Option<u64>,
         enable_multi_glob_path_tasks: Option<bool>,
     ) -> PyResult<Self> {
         let mut config = self.config.as_ref().clone();
@@ -243,10 +255,10 @@ impl PyDaftExecutionConfig {
         if let Some(shuffle_algorithm) = shuffle_algorithm {
             if !matches!(
                 shuffle_algorithm,
-                "map_reduce" | "pre_shuffle_merge" | "flight_shuffle" | "auto"
+                "map_reduce" | "pre_shuffle_merge" | "flight_shuffle" | "celeborn" | "auto"
             ) {
                 return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "shuffle_algorithm must be 'auto', 'map_reduce', 'pre_shuffle_merge', or 'flight_shuffle'",
+                    "shuffle_algorithm must be 'auto', 'map_reduce', 'pre_shuffle_merge', 'flight_shuffle', or 'celeborn'",
                 ));
             }
             config.shuffle_algorithm = shuffle_algorithm.to_string();
@@ -302,6 +314,57 @@ impl PyDaftExecutionConfig {
                 ));
             }
             config.flight_shuffle_dirs = flight_shuffle_dirs;
+        }
+
+        // Celeborn configuration — assemble or update the CelebornConfig.
+        // If any celeborn_* parameter is provided, we either update an existing
+        // CelebornConfig or create a new one with defaults for unset fields.
+        if celeborn_lm_host.is_some()
+            || celeborn_lm_port.is_some()
+            || celeborn_app_id.is_some()
+            || celeborn_compression.is_some()
+            || celeborn_push_data_timeout_ms.is_some()
+            || celeborn_fetch_data_timeout_ms.is_some()
+        {
+            let mut celeborn = config.celeborn.take().unwrap_or_else(|| CelebornConfig {
+                lm_host: String::new(),
+                lm_port: 0,
+                app_id: String::new(),
+                compression: "lz4".to_string(),
+                push_data_timeout_ms: None,
+                fetch_data_timeout_ms: None,
+            });
+
+            if let Some(host) = celeborn_lm_host {
+                if host.trim().is_empty() {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "celeborn_lm_host must not be empty",
+                    ));
+                }
+                celeborn.lm_host = host;
+            }
+            if let Some(port) = celeborn_lm_port {
+                celeborn.lm_port = port;
+            }
+            if let Some(app_id) = celeborn_app_id {
+                celeborn.app_id = app_id;
+            }
+            if let Some(compression) = celeborn_compression {
+                if !matches!(compression.as_str(), "lz4" | "zstd" | "none") {
+                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "celeborn_compression must be 'lz4', 'zstd', or 'none'",
+                    ));
+                }
+                celeborn.compression = compression;
+            }
+            if let Some(timeout) = celeborn_push_data_timeout_ms {
+                celeborn.push_data_timeout_ms = Some(timeout);
+            }
+            if let Some(timeout) = celeborn_fetch_data_timeout_ms {
+                celeborn.fetch_data_timeout_ms = Some(timeout);
+            }
+
+            config.celeborn = Some(celeborn);
         }
 
         if let Some(enable_multi_glob_path_tasks) = enable_multi_glob_path_tasks {
@@ -474,6 +537,26 @@ impl PyDaftExecutionConfig {
     #[getter]
     fn enable_multi_glob_path_tasks(&self) -> PyResult<bool> {
         Ok(self.config.enable_multi_glob_path_tasks)
+    }
+
+    #[getter]
+    fn celeborn_lm_host(&self) -> PyResult<Option<String>> {
+        Ok(self.config.celeborn.as_ref().map(|c| c.lm_host.clone()))
+    }
+
+    #[getter]
+    fn celeborn_lm_port(&self) -> PyResult<Option<i32>> {
+        Ok(self.config.celeborn.as_ref().map(|c| c.lm_port))
+    }
+
+    #[getter]
+    fn celeborn_app_id(&self) -> PyResult<Option<String>> {
+        Ok(self.config.celeborn.as_ref().map(|c| c.app_id.clone()))
+    }
+
+    #[getter]
+    fn celeborn_compression(&self) -> PyResult<Option<String>> {
+        Ok(self.config.celeborn.as_ref().map(|c| c.compression.clone()))
     }
 }
 

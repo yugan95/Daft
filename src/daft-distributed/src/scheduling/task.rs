@@ -4,6 +4,8 @@ use common_daft_config::DaftExecutionConfig;
 use common_error::DaftError;
 use common_partitioning::PartitionRef;
 use common_resource_request::ResourceRequest;
+#[cfg(feature = "celeborn")]
+use daft_local_plan::CelebornShuffleReadInput;
 use daft_local_plan::{
     ExecutionStats, FlightShuffleReadInput, Input, LocalPhysicalPlanRef, SourceId,
 };
@@ -463,6 +465,18 @@ impl SwordfishTaskBuilder {
         self
     }
 
+    /// Add celeborn shuffle read inputs with source_id to the builder.
+    #[cfg(feature = "celeborn")]
+    pub fn with_celeborn_shuffle_reads(
+        mut self,
+        source_id: SourceId,
+        inputs: Vec<CelebornShuffleReadInput>,
+    ) -> Self {
+        self.inputs
+            .insert(source_id, Input::CelebornShuffle(inputs));
+        self
+    }
+
     /// Add a notify token to the builder. Returns the builder and the receiver for the token.
     pub fn add_notify_token(mut self) -> (Self, OneshotReceiver<()>) {
         let (notify_token, notify_rx) = create_oneshot_channel();
@@ -507,6 +521,11 @@ impl SwordfishTaskBuilder {
                             found_any = true;
                         }
                     }
+                }
+                #[cfg(feature = "celeborn")]
+                Input::CelebornShuffle(_) => {
+                    // Celeborn shuffle inputs don't carry row count metadata
+                    // at task-build time.
                 }
             }
         }
